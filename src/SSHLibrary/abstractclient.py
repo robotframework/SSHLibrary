@@ -73,6 +73,7 @@ class AbstractSSHClient(object):
         self._scp_all_client = None
         self._shell = None
         self._started_commands = []
+        self._receive_buffer = ""
         self.client = self._get_client()
         self.width = width
         self.height = height
@@ -419,7 +420,9 @@ class AbstractSSHClient(object):
         output = self.shell.read()
         if delay:
             output += self._delayed_read(delay)
-        return self._decode(output)
+        output = self._receive_buffer + self._decode(output)
+        self._receive_buffer = ""
+        return output
 
     def _delayed_read(self, delay):
         delay = TimeEntry(delay).value
@@ -443,14 +446,19 @@ class AbstractSSHClient(object):
         """
         server_output = b''
         while True:
-            try:
-                server_output += self.shell.read_byte()
-                return self._decode(server_output)
-            except UnicodeDecodeError as e:
-                if e.reason == 'unexpected end of data':
-                    pass
-                else:
-                    raise
+            if self._receive_buffer:
+                char = self._receive_buffer[0]
+                self._receive_buffer = self._receive_buffer[1:]
+                return char
+            else:
+                try:
+                    server_output += self.shell.read_byte()
+                    return self._decode(server_output)
+                except UnicodeDecodeError as e:
+                    if e.reason == 'unexpected end of data':
+                        pass
+                    else:
+                        raise
 
     def read_until(self, expected):
         """Reads output from the current shell until the `expected` text is
@@ -471,18 +479,21 @@ class AbstractSSHClient(object):
         return self._read_until(lambda s: expected in s, expected)
 
     def _read_until(self, matcher, expected, timeout=None):
-        output = ''
         timeout = TimeEntry(timeout) if timeout else self.config.get('timeout')
         max_time = time.time() + timeout.value
         while time.time() < max_time:
-            char = self.read_char()
-            if not char:
-                time.sleep(.00001)  # Release GIL so paramiko I/O thread can run
-            output += char
-            if matcher(output):
+            self._receive_buffer = self.read()
+            match = matcher(self._receive_buffer)
+            if match:
+                if hasattr(match, "end"):
+                    end = match.end() + 1
+                else:
+                    end = self._receive_buffer.index(expected)+len(expected)
+                output = self._receive_buffer[0:end]
+                self._receive_buffer = self._receive_buffer[end:]
                 return output
         raise SSHClientException("No match found for '%s' in %s\nOutput:\n%s."
-                                 % (expected, timeout, output))
+                                 % (expected, timeout, self._receive_buffer))
 
     def read_until_newline(self):
         """Reads output from the current shell until a newline character is
@@ -573,16 +584,19 @@ class AbstractSSHClient(object):
             regexp = re.compile(regexp)
         matcher = regexp.search
         expected = regexp.pattern
-        ret = ""
         timeout = self.config.get('timeout')
         start_time = time.time()
         while time.time() < float(timeout.value) + start_time:
-            ret += self.read_char()
-            if matcher(prefix + self._encode(ret)):
+            self._receive_buffer = self.read()
+            match = matcher(prefix + self._receive_buffer)
+            if match:
+                end = match.end() - len(prefix)
+                ret = self._receive_buffer[0:end]
+                self._receive_buffer = self._receive_buffer[end:]
                 return ret
         raise SSHClientException(
             "No match found for '%s' in %s\nOutput:\n%s"
-            % (expected, timeout, ret))
+            % (expected, timeout, self._receive_buffer))
 
     def write_until_expected(self, text, expected, timeout, interval):
         """Writes `text` repeatedly in the current shell until the `expected`
