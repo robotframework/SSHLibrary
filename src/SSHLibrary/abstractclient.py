@@ -444,21 +444,21 @@ class AbstractSSHClient(object):
 
         :returns: A single char read from the output.
         """
+        if self._receive_buffer:
+            char = self._receive_buffer[0]
+            self._receive_buffer = self._receive_buffer[1:]
+            return char
+
         server_output = b''
         while True:
-            if self._receive_buffer:
-                char = self._receive_buffer[0]
-                self._receive_buffer = self._receive_buffer[1:]
-                return char
-            else:
-                try:
-                    server_output += self.shell.read_byte()
-                    return self._decode(server_output)
-                except UnicodeDecodeError as e:
-                    if e.reason == 'unexpected end of data':
-                        pass
-                    else:
-                        raise
+            try:
+                server_output += self.shell.read_byte()
+                return self._decode(server_output)
+            except UnicodeDecodeError as e:
+                if e.reason == 'unexpected end of data':
+                    pass
+                else:
+                    raise
 
     def read_until(self, expected):
         """Reads output from the current shell until the `expected` text is
@@ -482,18 +482,42 @@ class AbstractSSHClient(object):
         timeout = TimeEntry(timeout) if timeout else self.config.get('timeout')
         max_time = time.time() + timeout.value
         while time.time() < max_time:
-            self._receive_buffer = self.read()
+            undecoded = self._single_complete_read_to_buffer(max_time)
+            if undecoded:
+                self._receive_buffer += undecoded.decode(
+                    self.config.encoding, "ignore"
+                )
             match = matcher(self._receive_buffer)
             if match:
                 if hasattr(match, "end"):
                     end = match.end() + 1
                 else:
-                    end = self._receive_buffer.index(expected)+len(expected)
+                    end = self._receive_buffer.index(expected) + len(expected)
                 output = self._receive_buffer[0:end]
                 self._receive_buffer = self._receive_buffer[end:]
                 return output
+        output = self._receive_buffer
+        self._receive_buffer = ""
         raise SSHClientException("No match found for '%s' in %s\nOutput:\n%s."
-                                 % (expected, timeout, self._receive_buffer))
+                                 % (expected, timeout, output))
+
+    def _single_complete_read_to_buffer(self, max_time):
+        """Fill receive buffer with a single read with completed
+        last character.
+
+        In case of timeout, leftover bytes are returned.
+        """
+        server_output = self.shell.read()
+        while time.time() < max_time:
+            try:
+                self._receive_buffer += self._decode(server_output)
+                return None
+            except UnicodeDecodeError as e:
+                if e.reason == 'unexpected end of data':
+                    server_output += self.shell.read_byte()
+                else:
+                    raise
+        return server_output
 
     def read_until_newline(self):
         """Reads output from the current shell until a newline character is
@@ -585,18 +609,24 @@ class AbstractSSHClient(object):
         matcher = regexp.search
         expected = regexp.pattern
         timeout = self.config.get('timeout')
-        start_time = time.time()
-        while time.time() < float(timeout.value) + start_time:
-            self._receive_buffer = self.read()
+        max_time = time.time() + float(timeout.value)
+        while time.time() < max_time:
+            undecoded = self._single_complete_read_to_buffer(max_time)
+            if undecoded:
+                self._receive_buffer += undecoded.decode(
+                    self.config.encoding, "ignore"
+                )
             match = matcher(prefix + self._receive_buffer)
             if match:
                 end = match.end() - len(prefix)
                 ret = self._receive_buffer[0:end]
                 self._receive_buffer = self._receive_buffer[end:]
                 return ret
+        output = self._receive_buffer
+        self._receive_buffer = ""
         raise SSHClientException(
             "No match found for '%s' in %s\nOutput:\n%s"
-            % (expected, timeout, self._receive_buffer))
+            % (expected, timeout, output))
 
     def write_until_expected(self, text, expected, timeout, interval):
         """Writes `text` repeatedly in the current shell until the `expected`
